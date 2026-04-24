@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
@@ -651,16 +652,36 @@ def evaluate_decoder(
     quant_outputs = _run_decoder_model(quant_model, eval_samples)
 
     per_sample: list[dict[str, Any]] = []
+    finite_metrics: dict[str, list[float]] = {}
     for paths, ref_output, quant_output in zip(eval_paths, fp_outputs, quant_outputs):
         metrics = compute_decoder_metrics(ref_output, quant_output)
         metrics["sample"] = paths[0].name
+        for key, value in list(metrics.items()):
+            if key == "sample":
+                continue
+            value = float(value)
+            if math.isfinite(value):
+                finite_metrics.setdefault(key, []).append(value)
+                metrics[key] = value
+            else:
+                LOGGER.warning(
+                    "Non-finite metric detected and excluded from mean: sample=%s metric=%s value=%s",
+                    metrics["sample"],
+                    key,
+                    value,
+                )
+                metrics[key] = 0.0
         per_sample.append(metrics)
 
     metric_keys = [key for key in per_sample[0].keys() if key != "sample"]
-    mean_metrics = {
-        key: sum(float(item[key]) for item in per_sample) / len(per_sample)
-        for key in metric_keys
-    }
+    mean_metrics: dict[str, float] = {}
+    for key in metric_keys:
+        values = finite_metrics.get(key, [])
+        if values:
+            mean_metrics[key] = float(sum(values) / len(values))
+        else:
+            LOGGER.warning("All values are non-finite for metric=%s; forcing mean to 0.0", key)
+            mean_metrics[key] = 0.0
     return EvalBundle(mean_metrics=mean_metrics, per_sample=per_sample)
 
 
