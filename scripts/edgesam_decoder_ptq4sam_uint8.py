@@ -660,9 +660,9 @@ def evaluate_decoder(
             if key == "sample":
                 continue
             value = float(value)
+            metrics[key] = value
             if math.isfinite(value):
                 finite_metrics.setdefault(key, []).append(value)
-                metrics[key] = value
             else:
                 LOGGER.warning(
                     "Non-finite metric detected and excluded from mean: sample=%s metric=%s value=%s",
@@ -670,7 +670,6 @@ def evaluate_decoder(
                     key,
                     value,
                 )
-                metrics[key] = 0.0
         per_sample.append(metrics)
 
     metric_keys = [key for key in per_sample[0].keys() if key != "sample"]
@@ -680,8 +679,8 @@ def evaluate_decoder(
         if values:
             mean_metrics[key] = float(sum(values) / len(values))
         else:
-            LOGGER.warning("All values are non-finite for metric=%s; forcing mean to 0.0", key)
-            mean_metrics[key] = 0.0
+            LOGGER.warning("All values are non-finite for metric=%s; mean will be NaN", key)
+            mean_metrics[key] = float("nan")
     return EvalBundle(mean_metrics=mean_metrics, per_sample=per_sample)
 
 

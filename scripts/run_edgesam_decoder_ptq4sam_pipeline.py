@@ -144,8 +144,14 @@ def adapt_decoder_dense_embedding_size(decoder: torch.nn.Module, image_h: int, i
         mode="bilinear",
         align_corners=False,
     )
-    with torch.no_grad():
-        dense_embedding.copy_(resized)
+    resized = resized.to(device=dense_embedding.device, dtype=dense_embedding.dtype).contiguous()
+
+    # Buffer shape changes from e.g. [1, C, 1, 1] to [1, C, H, W], so we must replace
+    # the buffer instead of using in-place copy_ (which requires identical shapes).
+    if isinstance(getattr(decoder, "_buffers", None), dict) and "dense_embedding" in decoder._buffers:
+        decoder._buffers["dense_embedding"] = resized
+    else:
+        setattr(decoder, "dense_embedding", resized)
 
     setattr(decoder, "embed_h", image_h)
     setattr(decoder, "embed_w", image_w)
