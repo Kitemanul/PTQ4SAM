@@ -108,6 +108,7 @@ def build_dummy_inputs(
     args: argparse.Namespace,
     decoder: torch.nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     image_b, image_c, image_h, image_w = args.image_embeddings_shape
     pe_b, pe_n, pe_c = args.point_embedding_pe_shape
     labels_b, labels_n = args.point_labels_shape
@@ -133,7 +134,6 @@ def build_dummy_inputs(
     dummy_pe = torch.randn(pe_b, pe_n, pe_c, dtype=torch.float32)
     dummy_labels = torch.randint(0, 4, (labels_b, labels_n), dtype=torch.int64).to(torch.float32)
     return dummy_embeddings, dummy_pe, dummy_labels
-
 
 def main() -> None:
     args = parse_args()
@@ -197,6 +197,7 @@ def main() -> None:
 
     onnx_path = resolve_output_path(str(checkpoint_path), args.onnx_output, args.scope)
     dummy_inputs = build_dummy_inputs(args, quant_model)
+    dummy_inputs = build_dummy_inputs(args)
     export_quantized_decoder_to_onnx(
         quant_model,
         output_path=onnx_path,
