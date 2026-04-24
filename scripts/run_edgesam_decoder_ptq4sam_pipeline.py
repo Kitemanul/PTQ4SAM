@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 from datetime import datetime
 from pathlib import Path
 import time
@@ -13,6 +14,14 @@ CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def ensure_wandb_stub() -> None:
+    if "wandb" not in sys.modules:
+        sys.modules["wandb"] = types.ModuleType("wandb")
+
+
+ensure_wandb_stub()
 
 from edge_sam.quantization.decoder_ptq_compare import _build_decoder_surface, collect_decoder_sample_triplets
 from scripts.edgesam_decoder_ptq4sam_uint8 import (
