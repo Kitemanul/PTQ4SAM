@@ -5,6 +5,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+import time
 
 import torch
 
@@ -28,6 +29,11 @@ from scripts.export_edgesam_decoder_ptq4sam_onnx import (
     resolve_output_path,
 )
 from ptq4sam.quantization.state import enable_quantization
+
+
+def log_progress(message: str) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,10 +110,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_dummy_inputs(
-    args: argparse.Namespace,
-    decoder: torch.nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     image_b, image_c, image_h, image_w = args.image_embeddings_shape
     pe_b, pe_n, pe_c = args.point_embedding_pe_shape
@@ -120,30 +122,31 @@ def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Te
     if image_c != pe_c:
         raise ValueError("Channel mismatch between image_embeddings and point_embedding_pe")
 
-    model_c = int(getattr(decoder, "dense_embedding").shape[1])
-    model_h = int(getattr(decoder, "embed_h", getattr(decoder, "dense_embedding").shape[2]))
-    model_w = int(getattr(decoder, "embed_w", getattr(decoder, "dense_embedding").shape[3]))
-    if image_c != model_c or image_h != model_h or image_w != model_w:
-        raise ValueError(
-            "image_embeddings shape does not match decoder expectation: "
-            f"got [{image_b}, {image_c}, {image_h}, {image_w}], "
-            f"expected [B, {model_c}, {model_h}, {model_w}]"
-        )
-
     dummy_embeddings = torch.randn(image_b, image_c, image_h, image_w, dtype=torch.float32)
     dummy_pe = torch.randn(pe_b, pe_n, pe_c, dtype=torch.float32)
     dummy_labels = torch.randint(0, 4, (labels_b, labels_n), dtype=torch.int64).to(torch.float32)
     return dummy_embeddings, dummy_pe, dummy_labels
 
 def main() -> None:
+    start_time = time.perf_counter()
+    log_progress("Starting EdgeSAM decoder PTQ4SAM pipeline")
     args = parse_args()
+    log_progress(
+        "Args loaded: "
+        f"scope={args.scope}, bit={args.bit}, calibration_count={args.calibration_count}, eval_count={args.eval_count}"
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required because PTQ4SAM BIG/AGQ calibration code uses CUDA tensors")
+    log_progress("CUDA available")
 
     checkpoint_path = Path(args.checkpoint).resolve()
+    log_progress(f"Collecting calibration samples from {args.calibration_list}")
     calibration_paths = collect_decoder_sample_triplets(args.calibration_list, limit=args.calibration_count)
+    log_progress(f"Collected calibration samples: {len(calibration_paths)}")
+    log_progress(f"Collecting eval samples from {args.eval_list}")
     eval_paths = collect_decoder_sample_triplets(args.eval_list, limit=args.eval_count)
+    log_progress(f"Collected eval samples: {len(eval_paths)}")
 
     if len(calibration_paths) < args.calibration_count:
         raise ValueError(f"Requested {args.calibration_count} calibration samples but found {len(calibration_paths)}")
@@ -155,16 +158,25 @@ def main() -> None:
     config_quant.ptq4sam.AGQ = not args.disable_agq
 
     device = torch.device("cuda:0")
+    log_progress(f"Using device: {device}")
 
+    log_progress("Building FP model")
     fp_model = _build_decoder_surface(checkpoint_path, use_stability_score=True).to(device).eval()
+    log_progress("Building quant model")
     quant_model = _build_decoder_surface(checkpoint_path, use_stability_score=True).to(device).eval()
+    log_progress("Applying quantization wrappers")
     quant_model = quantize_decoder_surface(quant_model, config_quant, scope=args.scope).to(device).eval()
 
+    log_progress("Loading calibration tensors to device")
     calibration_samples = move_samples_to_device(calibration_paths, device)
+    log_progress("Running calibration")
     calibrate_decoder(quant_model, calibration_samples, config_quant.ptq4sam.BIG)
+    log_progress("Enabling quantization")
     enable_quantization(quant_model)
 
+    log_progress("Running decoder evaluation")
     bundle = evaluate_decoder(fp_model, quant_model, eval_paths)
+    log_progress("Evaluation complete")
 
     if args.summary_output_dir is not None:
         summary_output_dir = Path(args.summary_output_dir)
@@ -194,10 +206,12 @@ def main() -> None:
     summary_path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary["mean_metrics"], indent=2))
     print(f"Saved summary to {summary_path}")
+    log_progress(f"Summary written to {summary_path}")
 
     onnx_path = resolve_output_path(str(checkpoint_path), args.onnx_output, args.scope)
-    dummy_inputs = build_dummy_inputs(args, quant_model)
+    log_progress(f"Preparing ONNX export to {onnx_path}")
     dummy_inputs = build_dummy_inputs(args)
+    log_progress("Exporting quantized decoder to ONNX")
     export_quantized_decoder_to_onnx(
         quant_model,
         output_path=onnx_path,
@@ -208,11 +222,16 @@ def main() -> None:
     pe_path = export_pe_gaussian_matrix(str(checkpoint_path), onnx_path)
     print(f"Exported quantized decoder ONNX to {onnx_path}")
     print(f"Exported PE gaussian matrix to {pe_path}")
+    log_progress("Printing ONNX operator summary")
     _print_onnx_summary(onnx_path)
 
     if args.check_ops_only and onnx_path.exists():
         onnx_path.unlink()
         print(f"Removed {onnx_path} (check-ops-only mode)")
+        log_progress("ONNX removed due to --check-ops-only")
+
+    elapsed = time.perf_counter() - start_time
+    log_progress(f"Pipeline finished in {elapsed:.2f}s")
 
 
 if __name__ == "__main__":
