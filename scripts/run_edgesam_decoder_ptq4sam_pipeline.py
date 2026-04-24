@@ -127,6 +127,30 @@ def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Te
     dummy_labels = torch.randint(0, 4, (labels_b, labels_n), dtype=torch.int64).to(torch.float32)
     return dummy_embeddings, dummy_pe, dummy_labels
 
+
+def adapt_decoder_dense_embedding_size(decoder: torch.nn.Module, image_h: int, image_w: int) -> None:
+    dense_embedding = getattr(decoder, "dense_embedding", None)
+    if dense_embedding is None:
+        raise AttributeError("Decoder has no dense_embedding; cannot adapt export input spatial size")
+
+    current_h = int(dense_embedding.shape[2])
+    current_w = int(dense_embedding.shape[3])
+    if current_h == image_h and current_w == image_w:
+        return
+
+    resized = torch.nn.functional.interpolate(
+        dense_embedding.detach(),
+        size=(image_h, image_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    with torch.no_grad():
+        dense_embedding.copy_(resized)
+
+    setattr(decoder, "embed_h", image_h)
+    setattr(decoder, "embed_w", image_w)
+
+
 def main() -> None:
     start_time = time.perf_counter()
     log_progress("Starting EdgeSAM decoder PTQ4SAM pipeline")
@@ -211,6 +235,9 @@ def main() -> None:
     onnx_path = resolve_output_path(str(checkpoint_path), args.onnx_output, args.scope)
     log_progress(f"Preparing ONNX export to {onnx_path}")
     dummy_inputs = build_dummy_inputs(args)
+    _, _, image_h, image_w = args.image_embeddings_shape
+    log_progress(f"Adapting decoder dense_embedding to export size HxW={image_h}x{image_w}")
+    adapt_decoder_dense_embedding_size(quant_model, image_h=image_h, image_w=image_w)
     log_progress("Exporting quantized decoder to ONNX")
     export_quantized_decoder_to_onnx(
         quant_model,
