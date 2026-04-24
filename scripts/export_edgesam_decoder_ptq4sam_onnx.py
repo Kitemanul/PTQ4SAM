@@ -10,6 +10,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 def ensure_wandb_stub() -> None:
     if "wandb" not in sys.modules:

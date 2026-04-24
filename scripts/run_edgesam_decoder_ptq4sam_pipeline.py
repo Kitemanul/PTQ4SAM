@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import torch
+
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from edge_sam.quantization.decoder_ptq_compare import _build_decoder_surface, collect_decoder_sample_triplets
 from scripts.edgesam_decoder_ptq4sam_uint8 import (
@@ -65,7 +71,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output ONNX path; defaults to <checkpoint>_decoder_ptq4sam_uint8_<scope>.onnx",
     )
-<<<<<<< codex/review-project-and-recent-changes-832s4a
     parser.add_argument(
         "--image-embeddings-shape",
         type=int,
@@ -90,9 +95,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Dummy input shape for point_labels",
     )
-=======
-    parser.add_argument("--num-points", type=int, default=5, help="Static prompt count for exported ONNX")
->>>>>>> main
     parser.add_argument("--opset-version", type=int, default=11)
     parser.add_argument(
         "--check-ops-only",
@@ -102,7 +104,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-<<<<<<< codex/review-project-and-recent-changes-832s4a
+def build_dummy_inputs(
+    args: argparse.Namespace,
+    decoder: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     image_b, image_c, image_h, image_w = args.image_embeddings_shape
     pe_b, pe_n, pe_c = args.point_embedding_pe_shape
@@ -115,14 +120,21 @@ def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Te
     if image_c != pe_c:
         raise ValueError("Channel mismatch between image_embeddings and point_embedding_pe")
 
+    model_c = int(getattr(decoder, "dense_embedding").shape[1])
+    model_h = int(getattr(decoder, "embed_h", getattr(decoder, "dense_embedding").shape[2]))
+    model_w = int(getattr(decoder, "embed_w", getattr(decoder, "dense_embedding").shape[3]))
+    if image_c != model_c or image_h != model_h or image_w != model_w:
+        raise ValueError(
+            "image_embeddings shape does not match decoder expectation: "
+            f"got [{image_b}, {image_c}, {image_h}, {image_w}], "
+            f"expected [B, {model_c}, {model_h}, {model_w}]"
+        )
+
     dummy_embeddings = torch.randn(image_b, image_c, image_h, image_w, dtype=torch.float32)
     dummy_pe = torch.randn(pe_b, pe_n, pe_c, dtype=torch.float32)
     dummy_labels = torch.randint(0, 4, (labels_b, labels_n), dtype=torch.int64).to(torch.float32)
     return dummy_embeddings, dummy_pe, dummy_labels
 
-
-=======
->>>>>>> main
 def main() -> None:
     args = parse_args()
 
@@ -184,7 +196,7 @@ def main() -> None:
     print(f"Saved summary to {summary_path}")
 
     onnx_path = resolve_output_path(str(checkpoint_path), args.onnx_output, args.scope)
-<<<<<<< codex/review-project-and-recent-changes-832s4a
+    dummy_inputs = build_dummy_inputs(args, quant_model)
     dummy_inputs = build_dummy_inputs(args)
     export_quantized_decoder_to_onnx(
         quant_model,
@@ -192,13 +204,6 @@ def main() -> None:
         num_points=args.point_embedding_pe_shape[1],
         opset_version=args.opset_version,
         dummy_inputs=dummy_inputs,
-=======
-    export_quantized_decoder_to_onnx(
-        quant_model,
-        output_path=onnx_path,
-        num_points=args.num_points,
-        opset_version=args.opset_version,
->>>>>>> main
     )
     pe_path = export_pe_gaussian_matrix(str(checkpoint_path), onnx_path)
     print(f"Exported quantized decoder ONNX to {onnx_path}")
