@@ -10,6 +10,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 def ensure_wandb_stub() -> None:
     if "wandb" not in sys.modules:
@@ -144,15 +149,18 @@ def export_quantized_decoder_to_onnx(
     *,
     num_points: int,
     opset_version: int,
+    dummy_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     decoder = prepare_quantized_decoder_for_onnx_export(decoder)
-    embed_dim = getattr(decoder, "dense_embedding").shape[1]
-    embed_h = int(getattr(decoder, "embed_h", getattr(decoder, "dense_embedding").shape[2]))
-    embed_w = int(getattr(decoder, "embed_w", getattr(decoder, "dense_embedding").shape[3]))
-
-    dummy_embeddings = torch.randn(1, embed_dim, embed_h, embed_w, dtype=torch.float32)
-    dummy_pe = torch.randn(1, num_points, embed_dim, dtype=torch.float32)
-    dummy_labels = torch.randint(0, 4, (1, num_points), dtype=torch.int64).to(torch.float32)
+    if dummy_inputs is None:
+        embed_dim = getattr(decoder, "dense_embedding").shape[1]
+        embed_h = int(getattr(decoder, "embed_h", getattr(decoder, "dense_embedding").shape[2]))
+        embed_w = int(getattr(decoder, "embed_w", getattr(decoder, "dense_embedding").shape[3]))
+        dummy_embeddings = torch.randn(1, embed_dim, embed_h, embed_w, dtype=torch.float32)
+        dummy_pe = torch.randn(1, num_points, embed_dim, dtype=torch.float32)
+        dummy_labels = torch.randint(0, 4, (1, num_points), dtype=torch.int64).to(torch.float32)
+    else:
+        dummy_embeddings, dummy_pe, dummy_labels = dummy_inputs
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
