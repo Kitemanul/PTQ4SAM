@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from ptq4sam.quantization.fake_quant import AdaptiveGranularityQuantize
 from ptq4sam.quantization.observer import ObserverBase
+from ptq4sam.quantization.quantized_module import PreQuantizedLayer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,10 +21,12 @@ if "wandb" not in sys.modules:
     sys.modules["wandb"] = types.ModuleType("wandb")
 
 from scripts.export_edgesam_decoder_ptq4sam_onnx import (  # noqa: E402
+    _onnx_export,
     build_quantized_decoder_for_export,
     prepare_quantized_decoder_for_onnx_export,
     resolve_output_path,
 )
+from scripts.edgesam_decoder_ptq4sam_uint8 import make_qconfig
 
 
 class _DummySurface(nn.Module):
@@ -49,6 +52,15 @@ class ResolveOutputPathTest(unittest.TestCase):
         result = resolve_output_path("weights/edge_sam.pth", "tmp/custom.onnx", scope="full")
 
         self.assertEqual(result, Path("tmp/custom.onnx"))
+
+
+class OnnxExportOptionsTest(unittest.TestCase):
+    def test_disables_constant_folding_to_preserve_uint8_initializers(self) -> None:
+        with patch("scripts.export_edgesam_decoder_ptq4sam_onnx.torch.onnx.export") as export_mock:
+            _onnx_export("model", "args", output="toy.onnx")
+
+        _, kwargs = export_mock.call_args
+        self.assertFalse(kwargs["do_constant_folding"])
 
 
 class BuildQuantizedDecoderForExportTest(unittest.TestCase):
@@ -107,6 +119,21 @@ class PrepareQuantizedDecoderForOnnxExportTest(unittest.TestCase):
 
         self.assertTrue(hasattr(module, "zero_point"))
         self.assertTrue(torch.equal(module.zero_point, torch.tensor([0], dtype=torch.int32)))
+
+    def test_converts_prequantized_linear_weights_to_uint8_buffers(self) -> None:
+        qconfig = make_qconfig()
+
+        class _ToyModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layer = PreQuantizedLayer(nn.Linear(4, 3), None, qconfig.w_qconfig, qconfig.a_qconfig)
+
+        wrapper = _ToyModule()
+
+        prepared = prepare_quantized_decoder_for_onnx_export(wrapper)
+
+        self.assertTrue(hasattr(prepared.layer.module, "weight_q"))
+        self.assertEqual(prepared.layer.module.weight_q.dtype, torch.uint8)
 
 
 if __name__ == "__main__":
