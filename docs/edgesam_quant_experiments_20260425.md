@@ -55,3 +55,14 @@ ONE and onecc caveat:
 - Vanilla onecc quantizes both weights and activations, but activation quantization is per-layer scalar, not per-channel.
 - Therefore the current recommended W8A16 per-channel activation policy cannot be reproduced exactly by just setting onecc quantized_dtype.
 - PyTorch quantize then dequantize to plain FP32 can validate fake-quant numerics, but it is not a real UINT8 or INT16 deployment. For deployment, preserve explicit Q/DQ quantization in ONNX/Circle or extend ONE quantization support, then verify the final Circle or backend artifact really contains quantized execution.
+
+
+## ONE explicit-Q/DQ compile smoke
+
+Tested the deployment route after the initial recommendation. Vanilla onecc qconf cannot express W8A16 per-channel activations, so the viable route is explicit ONNX Q/DQ plus compatibility postprocessing.
+
+- Raw exact recommended affine-QDQ ONNX with AGQ failed on Less, GreaterOrEqual, dynamic Pow, optional Clip, constant Cast, and one dynamic reshape target.
+- Added tools/postprocess_edgesam_qdq_for_onecc.py to staticize params, rewrite bool ops, rewrite dynamic pow, lower Clip to Max/Min, and fold constant Casts.
+- Scripted output results/onecc_qdq_smoke_20260425/edgesam_recommended_affine_qdq_script_postprocessed.onnx passed onecc import+opt with fuse_gelu=True.
+- Optimized Circle contains 130 ONNXQuantizeLinear and 130 ONNXDequantizeLinear CustomOps. This verifies Circle import/opt, not final backend codegen.
+- Final backend codegen remains unverified because the current py312 one-cmds setup has no working one-codegen wrapper/backend driver.
