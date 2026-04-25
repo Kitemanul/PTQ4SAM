@@ -273,13 +273,26 @@ class QuantDecoderAttentionBlock(QuantizedBlock):
 
 
 class QuantGenericMLP(nn.Module):
-    def __init__(self, org_module: nn.Module, w_qconfig: AttrDict, a_qconfig: AttrDict) -> None:
+    def __init__(
+        self,
+        org_module: nn.Module,
+        w_qconfig: AttrDict,
+        a_qconfig: AttrDict,
+        *,
+        quantize_output: bool = True,
+        output_quant_bit: int | None = None,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             PreQuantizedLayer(layer, None, w_qconfig, a_qconfig) for layer in org_module.layers
         )
         self.sigmoid_output = getattr(org_module, "sigmoid_output", False)
-        self.output_post_act_fake_quantize = Quantizer(None, a_qconfig)
+        self.quantize_output = quantize_output
+        if quantize_output:
+            output_qconfig = clone_qconfig(a_qconfig, bit=output_quant_bit) if output_quant_bit is not None else a_qconfig
+            self.output_post_act_fake_quantize = Quantizer(None, output_qconfig)
+        else:
+            self.output_post_act_fake_quantize = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for index, layer in enumerate(self.layers):
@@ -403,12 +416,12 @@ class QuantDecoderLabelEmbedding(nn.Module):
         self.point_embeddings = org_module.point_embeddings
         self.not_a_point_embed = org_module.not_a_point_embed
         self.num_point_embeddings = org_module.num_point_embeddings
-        self.input_fake_quantize = Quantizer(None, a_qconfig)
+        self.input_act_fake_quantize = Quantizer(None, a_qconfig)
         self.not_a_point_weight_fake_quantize = WeightQuantizer(clone_qconfig(w_qconfig))
         self.point_weight_fake_quantizers = nn.ModuleList(
             WeightQuantizer(clone_qconfig(w_qconfig)) for _ in range(self.num_point_embeddings)
         )
-        self.output_fake_quantize = Quantizer(None, a_qconfig)
+        self.output_act_fake_quantize = Quantizer(None, a_qconfig)
 
     @staticmethod
     def _float_eq(x: torch.Tensor, value: float) -> torch.Tensor:
@@ -416,7 +429,7 @@ class QuantDecoderLabelEmbedding(nn.Module):
         return torch.relu(1.0 - diff * diff)
 
     def forward(self, point_embedding_pe: torch.Tensor, point_labels: torch.Tensor) -> torch.Tensor:
-        point_embedding_pe = self.input_fake_quantize(point_embedding_pe)
+        point_embedding_pe = self.input_act_fake_quantize(point_embedding_pe)
         point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding_pe)
         mask_neg1 = self._float_eq(point_labels, -1.0)
         sparse_embedding = point_embedding_pe * (1.0 - mask_neg1)
@@ -429,7 +442,7 @@ class QuantDecoderLabelEmbedding(nn.Module):
             sparse_embedding = sparse_embedding + self.point_weight_fake_quantizers[index](
                 self.point_embeddings[index].weight
             ) * mask
-        return self.output_fake_quantize(sparse_embedding)
+        return self.output_act_fake_quantize(sparse_embedding)
 
 
 class QuantOutputUpscaling(nn.Module):
@@ -451,10 +464,24 @@ class QuantOutputUpscaling(nn.Module):
 
 
 class QuantDecoderHypernetworkStack(nn.Module):
-    def __init__(self, org_module: DecoderHypernetworkStack, w_qconfig: AttrDict, a_qconfig: AttrDict) -> None:
+    def __init__(
+        self,
+        org_module: DecoderHypernetworkStack,
+        w_qconfig: AttrDict,
+        a_qconfig: AttrDict,
+        *,
+        quantize_output: bool = True,
+        output_quant_bit: int | None = None,
+    ) -> None:
         super().__init__()
         self.mlps = nn.ModuleList(
-            QuantGenericMLP(mlp, w_qconfig, a_qconfig) for mlp in org_module.mlps
+            QuantGenericMLP(
+                mlp,
+                w_qconfig,
+                a_qconfig,
+                quantize_output=quantize_output,
+                output_quant_bit=output_quant_bit,
+            ) for mlp in org_module.mlps
         )
         self.num_mask_tokens = org_module.num_mask_tokens
 
@@ -468,9 +495,25 @@ class QuantDecoderHypernetworkStack(nn.Module):
 
 
 class QuantMaskProjection(nn.Module):
-    def __init__(self, a_qconfig: AttrDict) -> None:
+    def __init__(
+        self,
+        a_qconfig: AttrDict,
+        *,
+        quantize_hyper_input: bool = True,
+        quantize_upscaled_input: bool = True,
+        hyper_input_quant_bit: int | None = None,
+        upscaled_input_quant_bit: int | None = None,
+    ) -> None:
         super().__init__()
-        self.matmul = QuantizedMatMul(a_qconfig)
+        hyper_qconfig = clone_qconfig(a_qconfig, bit=hyper_input_quant_bit) if hyper_input_quant_bit is not None else a_qconfig
+        upscaled_qconfig = clone_qconfig(a_qconfig, bit=upscaled_input_quant_bit) if upscaled_input_quant_bit is not None else a_qconfig
+        self.matmul = QuantizedMatMul(
+            a_qconfig,
+            quantize_a_input=quantize_hyper_input,
+            quantize_b_input=quantize_upscaled_input,
+            a_input_qconfig=hyper_qconfig,
+            b_input_qconfig=upscaled_qconfig,
+        )
 
     def forward(self, hyper_in: torch.Tensor, upscaled: torch.Tensor) -> torch.Tensor:
         batch_size = upscaled.size(0)
@@ -514,9 +557,43 @@ class QuantDecoderScoreHead(nn.Module):
         return self.score_post_act_fake_quantize(scores)
 
 
+FULL_DECODER_EXCLUDE_CHOICES = frozenset({
+    "output_upscaling",
+    "output_hypernetworks",
+    "mask_projection",
+    "score_head",
+})
+
+
+class FloatMaskProjection(nn.Module):
+    def forward(self, hyper_in: torch.Tensor, upscaled: torch.Tensor) -> torch.Tensor:
+        batch_size = upscaled.size(0)
+        channels = upscaled.size(1)
+        spatial = upscaled.size(2) * upscaled.size(3)
+        flat = upscaled.reshape(batch_size, channels, spatial)
+        return torch.matmul(hyper_in, flat)
+
+
 class QuantFullDecoderSurface(nn.Module):
-    def __init__(self, org_module: nn.Module, config_quant: AttrDict) -> None:
+    def __init__(
+        self,
+        org_module: nn.Module,
+        config_quant: AttrDict,
+        full_exclude: tuple[str, ...] = (),
+        *,
+        quantize_hypernetwork_output: bool = True,
+        quantize_mask_projection_hyper_input: bool = True,
+        quantize_mask_projection_upscaled_input: bool = True,
+        hypernetwork_output_bit: int | None = None,
+        mask_projection_hyper_input_bit: int | None = None,
+        mask_projection_upscaled_input_bit: int | None = None,
+    ) -> None:
         super().__init__()
+        unsupported = sorted(set(full_exclude) - set(FULL_DECODER_EXCLUDE_CHOICES))
+        if unsupported:
+            raise ValueError(f"Unsupported full decoder exclusions: {unsupported}")
+        excluded = set(full_exclude)
+        self.full_exclude = tuple(full_exclude)
         self.label_embedding = QuantDecoderLabelEmbedding(
             org_module.label_embedding,
             config_quant.w_qconfig,
@@ -534,22 +611,42 @@ class QuantFullDecoderSurface(nn.Module):
         self.mask_tokens_weight_fake_quantize = WeightQuantizer(clone_qconfig(config_quant.w_qconfig))
         self.register_buffer("dense_embedding", org_module.dense_embedding.clone())
         self.register_buffer("image_pe", org_module.image_pe.clone())
-        self.output_upscaling = QuantOutputUpscaling(
-            org_module.output_upscaling,
-            config_quant.w_qconfig,
-            config_quant.a_qconfig,
-        )
-        self.output_hypernetworks = QuantDecoderHypernetworkStack(
-            org_module.output_hypernetworks,
-            config_quant.w_qconfig,
-            config_quant.a_qconfig,
-        )
-        self.mask_projection = QuantMaskProjection(config_quant.a_qconfig)
-        self.score_head = QuantDecoderScoreHead(
-            org_module.score_head,
-            config_quant.w_qconfig,
-            config_quant.a_qconfig,
-        )
+        if "output_upscaling" in excluded:
+            self.output_upscaling = org_module.output_upscaling
+        else:
+            self.output_upscaling = QuantOutputUpscaling(
+                org_module.output_upscaling,
+                config_quant.w_qconfig,
+                config_quant.a_qconfig,
+            )
+        if "output_hypernetworks" in excluded:
+            self.output_hypernetworks = org_module.output_hypernetworks
+        else:
+            self.output_hypernetworks = QuantDecoderHypernetworkStack(
+                org_module.output_hypernetworks,
+                config_quant.w_qconfig,
+                config_quant.a_qconfig,
+                quantize_output=quantize_hypernetwork_output,
+                output_quant_bit=hypernetwork_output_bit,
+            )
+        if "mask_projection" in excluded:
+            self.mask_projection = FloatMaskProjection()
+        else:
+            self.mask_projection = QuantMaskProjection(
+                config_quant.a_qconfig,
+                quantize_hyper_input=quantize_mask_projection_hyper_input,
+                quantize_upscaled_input=quantize_mask_projection_upscaled_input,
+                hyper_input_quant_bit=mask_projection_hyper_input_bit,
+                upscaled_input_quant_bit=mask_projection_upscaled_input_bit,
+            )
+        if "score_head" in excluded:
+            self.score_head = org_module.score_head
+        else:
+            self.score_head = QuantDecoderScoreHead(
+                org_module.score_head,
+                config_quant.w_qconfig,
+                config_quant.a_qconfig,
+            )
         self.num_mask_tokens = org_module.num_mask_tokens
         self.embed_h = org_module.embed_h
         self.embed_w = org_module.embed_w
@@ -603,9 +700,27 @@ def quantize_decoder_surface(
     model: nn.Module,
     config_quant: AttrDict,
     scope: str = "transformer",
+    full_exclude: tuple[str, ...] = (),
+    *,
+    quantize_hypernetwork_output: bool = True,
+    quantize_mask_projection_hyper_input: bool = True,
+    quantize_mask_projection_upscaled_input: bool = True,
+    hypernetwork_output_bit: int | None = None,
+    mask_projection_hyper_input_bit: int | None = None,
+    mask_projection_upscaled_input_bit: int | None = None,
 ) -> nn.Module:
     if scope == "full":
-        return QuantFullDecoderSurface(model, config_quant)
+        return QuantFullDecoderSurface(
+            model,
+            config_quant,
+            full_exclude=full_exclude,
+            quantize_hypernetwork_output=quantize_hypernetwork_output,
+            quantize_mask_projection_hyper_input=quantize_mask_projection_hyper_input,
+            quantize_mask_projection_upscaled_input=quantize_mask_projection_upscaled_input,
+            hypernetwork_output_bit=hypernetwork_output_bit,
+            mask_projection_hyper_input_bit=mask_projection_hyper_input_bit,
+            mask_projection_upscaled_input_bit=mask_projection_upscaled_input_bit,
+        )
     if scope != "transformer":
         raise ValueError(f"Unsupported quantization scope: {scope}")
     model.transformer = QuantEdgeTwoWayTransformer(

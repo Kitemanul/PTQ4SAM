@@ -213,17 +213,30 @@ class PreQuantizedLayer(QuantizedModule):
         return x
 
 class QuantizedMatMul(QuantizedModule):
-    def __init__(self, a_qconfig, qinput=True):
+    def __init__(
+        self,
+        a_qconfig,
+        qinput=True,
+        *,
+        quantize_a_input: bool = True,
+        quantize_b_input: bool = True,
+        a_input_qconfig=None,
+        b_input_qconfig=None,
+    ):
         super().__init__()
         self.qinput = qinput
-        if qinput:
-            self.a_layer_pre_act_fake_quantize = Quantizer(None, a_qconfig)
-            self.b_layer_pre_act_fake_quantize = Quantizer(None, a_qconfig)
+        self.quantize_a_input = bool(qinput and quantize_a_input)
+        self.quantize_b_input = bool(qinput and quantize_b_input)
+        if self.quantize_a_input:
+            self.a_layer_pre_act_fake_quantize = Quantizer(None, a_input_qconfig or a_qconfig)
+        if self.quantize_b_input:
+            self.b_layer_pre_act_fake_quantize = Quantizer(None, b_input_qconfig or a_qconfig)
     
     def forward(self, inputs):
         a, b = inputs
-        if self.qinput:
+        if self.quantize_a_input:
             a = self.a_layer_pre_act_fake_quantize(a)
+        if self.quantize_b_input:
             b = self.b_layer_pre_act_fake_quantize(b)
         x = a @ b
         return x

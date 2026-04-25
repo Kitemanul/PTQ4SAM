@@ -43,7 +43,7 @@ def resolve_output_path(checkpoint: str, output: str | None, scope: str) -> Path
         return Path(output)
     checkpoint_path = Path(checkpoint)
     stem = checkpoint_path.stem
-    return checkpoint_path.with_name(f"{stem}_decoder_ptq4sam_uint8_{scope}.onnx")
+    return checkpoint_path.with_name(f"{stem}_decoder_ptq4sam_fp32_{scope}.onnx")
 
 
 def export_pe_gaussian_matrix(checkpoint: str, output_path: Path) -> Path:
@@ -89,6 +89,12 @@ def _clone_zero_point(module: QuantizeBase) -> torch.Tensor:
     return zero_point.detach().clone().to(torch.int32)
 
 
+def _round_nearest_without_round(x: torch.Tensor) -> torch.Tensor:
+    positive = torch.floor(x + 0.5)
+    negative = -torch.floor((-x) + 0.5)
+    return torch.where(x < 0, negative, positive)
+
+
 def _quantize_tensor_to_dtype(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -124,31 +130,15 @@ class ExportAffineQuantizer(nn.Module):
         self.quant_min = module.quant_min
         self.quant_max = module.quant_max
         self.ch_axis = module.ch_axis
-        self.qdtype = _export_dtype(self.quant_min, self.quant_max)
         self.register_buffer("scale", module.scale.detach().clone().to(torch.float32))
         self.register_buffer("zero_point", _clone_zero_point(module))
 
-    def quantize(self, x: torch.Tensor) -> torch.Tensor:
-        return _quantize_tensor_to_dtype(
-            x,
-            self.scale,
-            self.zero_point,
-            quant_min=self.quant_min,
-            quant_max=self.quant_max,
-            ch_axis=self.ch_axis,
-            qdtype=self.qdtype,
-        )
-
     def forward(self, x: torch.Tensor, value=None) -> torch.Tensor:
         del value
-        x_q = self.quantize(x)
-        return _dequantize_tensor_from_dtype(
-            x_q,
-            self.scale,
-            self.zero_point,
-            ch_axis=self.ch_axis,
-            dtype=x.dtype,
-        )
+        scale_view = _reshape_qparam(self.scale.to(x.dtype), x, self.ch_axis)
+        zero_view = _reshape_qparam(self.zero_point.to(x.dtype), x, self.ch_axis)
+        x_q = torch.clamp(_round_nearest_without_round(x / scale_view) + zero_view, self.quant_min, self.quant_max)
+        return (x_q - zero_view) * scale_view
 
 
 class ExportAdaptiveGranularityQuantizer(nn.Module):
@@ -156,25 +146,19 @@ class ExportAdaptiveGranularityQuantizer(nn.Module):
         super().__init__()
         self.quant_min = module.quant_min
         self.quant_max = module.quant_max
-        self.qdtype = _export_dtype(self.quant_min, self.quant_max)
         self.tau = float(module.tau)
         self.register_buffer("scale", module.scale.detach().clone().to(torch.float32))
         self.register_buffer("zero_point", _clone_zero_point(module))
 
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, value=None) -> torch.Tensor:
+        del value
         levels = self.quant_max - self.quant_min + 1
         scale = self.scale.to(x.dtype)
         x_safe = torch.clamp(x, 1e-20, None)
-        x_int = torch.round(-torch.log2(x_safe / scale) * self.tau)
+        x_int = _round_nearest_without_round(-torch.log2(x_safe / scale) * self.tau)
         softmax_mask = x_int >= levels
-        x_q = torch.clamp(x_int, 0, levels - 1).to(self.qdtype)
-        return x_q, softmax_mask
-
-    def forward(self, x: torch.Tensor, value=None) -> torch.Tensor:
-        del value
-        x_q, softmax_mask = self.quantize(x)
-        base = torch.tensor(2.0, dtype=x.dtype, device=x.device)
-        dequant = self.scale.to(x.dtype) * torch.pow(base, -x_q.to(x.dtype) / self.tau)
+        x_q = torch.clamp(x_int, 0, levels - 1)
+        dequant = scale * torch.pow(x.new_tensor(2.0), -x_q / self.tau)
         return torch.where(softmax_mask, torch.zeros_like(dequant), dequant)
 
 
@@ -381,7 +365,20 @@ def _convert_module_for_uint8_export(module: nn.Module) -> nn.Module:
 
 
 def prepare_quantized_decoder_for_onnx_export(decoder: torch.nn.Module) -> torch.nn.Module:
-    return _convert_module_for_uint8_export(decoder)
+    def convert(module: nn.Module) -> nn.Module:
+        if isinstance(module, AdaptiveGranularityQuantize):
+            if not hasattr(module, "zero_point"):
+                module.register_buffer("zero_point", _clone_zero_point(module))
+            return ExportAdaptiveGranularityQuantizer(module)
+        if isinstance(module, QuantizeBase):
+            if not hasattr(module, "zero_point"):
+                module.register_buffer("zero_point", _clone_zero_point(module))
+            return ExportAffineQuantizer(module)
+        for name, child in list(module.named_children()):
+            setattr(module, name, convert(child))
+        return module
+
+    return convert(decoder).eval()
 
 
 def _print_onnx_summary(onnx_path: Path) -> None:
@@ -494,7 +491,7 @@ def export_quantized_decoder_to_onnx(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export a PTQ4SAM-style EdgeSAM decoder ONNX with BIG/AGQ and uint8-backed quantized weights."
+        description="Export a PTQ4SAM-style EdgeSAM decoder ONNX as FP32, preserving BIG/AGQ fake-quant math."
     )
     parser.add_argument(
         "checkpoint",
@@ -546,7 +543,7 @@ def main() -> None:
     pe_path = export_pe_gaussian_matrix(args.checkpoint, output_path)
     print(f"Exported quantized decoder ONNX to {output_path}")
     print(f"Exported PE gaussian matrix to {pe_path}")
-    print("Note: this is a PTQ4SAM uint8-backed ONNX with explicit dequant math, not a QDQ-typed INT8 graph.")
+    print("Note: this is a PTQ4SAM FP32 ONNX traced from the calibrated fake-quant model, not a uint8-backed graph.")
     _print_onnx_summary(output_path)
     if args.check_ops_only:
         os.remove(output_path)

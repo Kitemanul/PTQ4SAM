@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -28,6 +29,11 @@ from scripts.export_edgesam_decoder_ptq4sam_onnx import (  # noqa: E402
 )
 from scripts.edgesam_decoder_ptq4sam_uint8 import make_qconfig
 
+try:
+    import onnx
+except ImportError:  # pragma: no cover
+    onnx = None
+
 
 class _DummySurface(nn.Module):
     def __init__(self) -> None:
@@ -43,10 +49,10 @@ class _DummySurface(nn.Module):
 
 
 class ResolveOutputPathTest(unittest.TestCase):
-    def test_uses_quantized_decoder_suffix_when_output_not_provided(self) -> None:
+    def test_uses_fp32_decoder_suffix_when_output_not_provided(self) -> None:
         result = resolve_output_path("weights/edge_sam.pth", None, scope="transformer")
 
-        self.assertEqual(result, Path("weights/edge_sam_decoder_ptq4sam_uint8_transformer.onnx"))
+        self.assertEqual(result, Path("weights/edge_sam_decoder_ptq4sam_fp32_transformer.onnx"))
 
     def test_preserves_explicit_output_path(self) -> None:
         result = resolve_output_path("weights/edge_sam.pth", "tmp/custom.onnx", scope="full")
@@ -55,7 +61,7 @@ class ResolveOutputPathTest(unittest.TestCase):
 
 
 class OnnxExportOptionsTest(unittest.TestCase):
-    def test_disables_constant_folding_to_preserve_uint8_initializers(self) -> None:
+    def test_disables_constant_folding_to_preserve_fake_quant_float_math(self) -> None:
         with patch("scripts.export_edgesam_decoder_ptq4sam_onnx.torch.onnx.export") as export_mock:
             _onnx_export("model", "args", output="toy.onnx")
 
@@ -109,18 +115,19 @@ class BuildQuantizedDecoderForExportTest(unittest.TestCase):
 
 
 class PrepareQuantizedDecoderForOnnxExportTest(unittest.TestCase):
-    def test_registers_zero_point_for_agq_modules(self) -> None:
+    def test_registers_zero_point_for_agq_modules_without_uint8_rewrite(self) -> None:
         module = AdaptiveGranularityQuantize(ObserverBase, bit=8, symmetric=False, ch_axis=-1)
         wrapper = nn.Sequential(module)
 
         self.assertFalse(hasattr(module, "zero_point"))
 
-        prepare_quantized_decoder_for_onnx_export(wrapper)
+        prepared = prepare_quantized_decoder_for_onnx_export(wrapper)
 
+        self.assertIs(prepared, wrapper)
         self.assertTrue(hasattr(module, "zero_point"))
         self.assertTrue(torch.equal(module.zero_point, torch.tensor([0], dtype=torch.int32)))
 
-    def test_converts_prequantized_linear_weights_to_uint8_buffers(self) -> None:
+    def test_keeps_prequantized_linear_without_uint8_weight_buffers(self) -> None:
         qconfig = make_qconfig()
 
         class _ToyModule(nn.Module):
@@ -132,8 +139,77 @@ class PrepareQuantizedDecoderForOnnxExportTest(unittest.TestCase):
 
         prepared = prepare_quantized_decoder_for_onnx_export(wrapper)
 
-        self.assertTrue(hasattr(prepared.layer.module, "weight_q"))
-        self.assertEqual(prepared.layer.module.weight_q.dtype, torch.uint8)
+        self.assertIs(prepared, wrapper)
+        self.assertFalse(hasattr(prepared.layer.module, "weight_q"))
+
+    @unittest.skipIf(onnx is None, "onnx is required for export inspection")
+    def test_exports_quantized_toy_model_as_fp32_onnx_without_uint8_initializers(self) -> None:
+        qconfig = make_qconfig()
+
+        class _ToyQuantizedModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layer = PreQuantizedLayer(nn.Linear(4, 4), None, qconfig.w_qconfig, qconfig.a_qconfig)
+                self.softmax_post_act_fake_quantize = AdaptiveGranularityQuantize(
+                    ObserverBase,
+                    bit=8,
+                    symmetric=False,
+                    ch_axis=-1,
+                )
+                self._freeze_affine_quantizer(self.layer.layer_pre_act_fake_quantize, 0.125, 0)
+                self._freeze_affine_quantizer(self.layer.module.weight_fake_quant, 0.0625, 0, numel=4)
+                self._freeze_agq(self.softmax_post_act_fake_quantize, 0.5, 2.0)
+
+            @staticmethod
+            def _freeze_affine_quantizer(module: nn.Module, scale: float, zero_point: int, numel: int = 1) -> None:
+                module.disable_observer()
+                module.enable_fake_quant()
+                scale_tensor = torch.full((numel,), scale, dtype=torch.float32)
+                if isinstance(module.scale, torch.nn.Parameter):
+                    module.scale = torch.nn.Parameter(scale_tensor)
+                else:
+                    module.scale.resize_((numel,))
+                    module.scale.copy_(scale_tensor)
+                module.zero_point.resize_((numel,))
+                module.zero_point.copy_(torch.full((numel,), zero_point, dtype=torch.int32))
+
+            @staticmethod
+            def _freeze_agq(module: AdaptiveGranularityQuantize, scale: float, tau: float) -> None:
+                module.disable_observer()
+                module.enable_fake_quant()
+                module.inited = True
+                module.tau = tau
+                module.scale.data.resize_((1,))
+                module.scale.data.copy_(torch.tensor([scale], dtype=torch.float32))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.layer(x)
+                x = torch.softmax(x, dim=-1)
+                return self.softmax_post_act_fake_quantize(x)
+
+        model = prepare_quantized_decoder_for_onnx_export(_ToyQuantizedModule()).eval()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "toy_fp32.onnx"
+            with torch.no_grad():
+                _onnx_export(
+                    model,
+                    (torch.randn(2, 4),),
+                    str(output_path),
+                    input_names=["x"],
+                    output_names=["y"],
+                    opset_version=11,
+                    verbose=False,
+                )
+
+            graph = onnx.load(str(output_path)).graph
+            init_dtypes = {initializer.data_type for initializer in graph.initializer}
+            op_types = {node.op_type for node in graph.node}
+            self.assertNotIn(2, init_dtypes)
+            self.assertNotIn(3, init_dtypes)
+            self.assertEqual(graph.input[0].type.tensor_type.elem_type, 1)
+            self.assertEqual(graph.output[0].type.tensor_type.elem_type, 1)
+            self.assertNotIn("Round", op_types)
 
 
 if __name__ == "__main__":

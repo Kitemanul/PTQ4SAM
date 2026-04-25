@@ -17,7 +17,11 @@ if str(REPO_ROOT) not in sys.path:
 if "wandb" not in sys.modules:
     sys.modules["wandb"] = types.ModuleType("wandb")
 
-from scripts.run_edgesam_decoder_ptq4sam_pipeline import ensure_wandb_stub, main  # noqa: E402
+from scripts.run_edgesam_decoder_ptq4sam_pipeline import (  # noqa: E402
+    adapt_decoder_dense_embedding_size,
+    ensure_wandb_stub,
+    main,
+)
 
 
 class _DummySurface(nn.Module):
@@ -34,6 +38,24 @@ class _DummySurface(nn.Module):
 
 
 class RunPipelineMainTest(unittest.TestCase):
+    def test_adapt_decoder_dense_embedding_size_resizes_image_pe_too(self) -> None:
+        class _SurfaceWithBuffers(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("dense_embedding", torch.randn(1, 256, 1, 1))
+                self.register_buffer("image_pe", torch.randn(1, 256, 64, 64))
+                self.embed_h = 64
+                self.embed_w = 64
+
+        model = _SurfaceWithBuffers()
+
+        adapt_decoder_dense_embedding_size(model, image_h=62, image_w=62)
+
+        self.assertEqual(tuple(model.dense_embedding.shape), (1, 256, 62, 62))
+        self.assertEqual(tuple(model.image_pe.shape), (1, 256, 62, 62))
+        self.assertEqual(model.embed_h, 62)
+        self.assertEqual(model.embed_w, 62)
+
     def test_ensure_wandb_stub_inserts_module(self) -> None:
         original = sys.modules.pop("wandb", None)
         try:
