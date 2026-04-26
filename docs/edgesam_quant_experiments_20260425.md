@@ -1,5 +1,9 @@
 # EdgeSAM decoder quantization experiments, 2026-04-25
 
+Canonical PTQ4SAM report: `docs/edgesam_decoder_quantization_report_20260425.md`.
+
+ONE/onecc strategy update: `docs/edgesam_decoder_onecc_quant_strategy_20260426.md`.
+
 ## Setup
 
 - Model: EdgeSAM decoder surface from `/home/kitemanul/project/EdgeSAM/weights/edge_sam.pth`.
