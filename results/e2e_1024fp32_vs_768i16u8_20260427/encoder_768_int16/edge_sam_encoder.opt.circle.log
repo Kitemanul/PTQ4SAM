@@ -1,0 +1,1 @@
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/circle2circle /home/kitemanul/project/PTQ4SAM/results/e2e_1024fp32_vs_768i16u8_20260427/encoder_768_int16/edge_sam_encoder.circle /home/kitemanul/project/PTQ4SAM/results/e2e_1024fp32_vs_768i16u8_20260427/encoder_768_int16/edge_sam_encoder.opt.circle --fuse_gelu
