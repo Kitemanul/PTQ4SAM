@@ -1,0 +1,34 @@
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/circle-quantizer --quantize_dequantize_weights float32 uint8 channel --config /home/kitemanul/project/PTQ4SAM/results/onecc_decoder_uint8_score_int16_20260426/decoder_score_int16.qconf.json /home/kitemanul/project/EdgeSAM/weights/one_pipeline/decoder/edge_sam_decoder.opt.circle /tmp/tmphu55q3ux/edge_sam_decoder.opt.weights_fake_quant.circle
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/record-minmax --input_model /tmp/tmphu55q3ux/edge_sam_decoder.opt.weights_fake_quant.circle --output_model /tmp/tmphu55q3ux/edge_sam_decoder.opt.minmax_recorded.circle --input_data /home/kitemanul/project/EdgeSAM/weights/one_pipeline/calib/decoder_calib_20.h5 --input_data_format h5 --num_threads 8 --min_percentile 1.0 --max_percentile 99.0 --moving_avg_batch 16 --moving_avg_const 0.1 --mode percentile
+Recording finished. Number of recorded data: 20
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/circle-quantizer --quantize_with_minmax float32 uint8 channel --input_type float32 --output_type float32 --config /home/kitemanul/project/PTQ4SAM/results/onecc_decoder_uint8_score_int16_20260426/decoder_score_int16.qconf.json /tmp/tmphu55q3ux/edge_sam_decoder.opt.minmax_recorded.circle /home/kitemanul/project/PTQ4SAM/results/onecc_decoder_uint8_score_int16_20260426/edge_sam_decoder.quant.circle
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/circle-quantizer --fake_quantize /home/kitemanul/project/PTQ4SAM/results/onecc_decoder_uint8_score_int16_20260426/edge_sam_decoder.quant.circle /tmp/tmphu55q3ux/edge_sam_decoder.opt.fake_quant.circle
+/home/kitemanul/project/ONE/build/py312/compiler/one-cmds/circle-eval-diff --first_model /home/kitemanul/project/EdgeSAM/weights/one_pipeline/decoder/edge_sam_decoder.opt.circle --second_model /tmp/tmphu55q3ux/edge_sam_decoder.opt.fake_quant.circle --first_input_data /home/kitemanul/project/EdgeSAM/weights/one_pipeline/calib/decoder_test_5.h5 --second_input_data /home/kitemanul/project/EdgeSAM/weights/one_pipeline/calib/decoder_test_5.h5 --input_data_format h5 --print_mae --print_mape --print_mpeir --print_top1_match --print_top5_match --print_mse
+Top-5metric for /Div is ignored, because it has elements less than 5
+Evaluating 0'th data
+Evaluating 1'th data
+Evaluating 2'th data
+Evaluating 3'th data
+Evaluating 4'th data
+Mean Absolute Error (MAE)
+MAE for /Div is 0.0691249
+MAE for /Reshape_6 is 1.13312
+
+Mean Absolute Percentage Error (MAPE)
+MAPE for /Div is 13.2974%
+MAPE for /Reshape_6 is 128.278%
+
+Mean Peak Error to Interval Ratio (MPEIR)
+MPEIR for /Div is 0.670847
+MPEIR for /Reshape_6 is 0.180119
+
+Ratio of Matched Indices between Top-1 results of the models
+Mean Top-1 match ratio for /Div is 0.6
+Mean Top-1 match ratio for /Reshape_6 is 0.4
+
+Ratio of Matched Indices between Top-5 results of the models
+Mean Top-5 match ratio for /Reshape_6 is 0.4
+
+Mean Squared Error (MSE)
+MSE for /Div is 0.0111926
+MSE for /Reshape_6 is 2.12286

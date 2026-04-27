@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 from datetime import datetime
 from pathlib import Path
 import time
@@ -13,6 +14,14 @@ CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def ensure_wandb_stub() -> None:
+    if "wandb" not in sys.modules:
+        sys.modules["wandb"] = types.ModuleType("wandb")
+
+
+ensure_wandb_stub()
 
 from edge_sam.quantization.decoder_ptq_compare import _build_decoder_surface, collect_decoder_sample_triplets
 from scripts.edgesam_decoder_ptq4sam_uint8 import (
@@ -128,31 +137,34 @@ def build_dummy_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Te
     return dummy_embeddings, dummy_pe, dummy_labels
 
 
-def adapt_decoder_dense_embedding_size(decoder: torch.nn.Module, image_h: int, image_w: int) -> None:
-    dense_embedding = getattr(decoder, "dense_embedding", None)
-    if dense_embedding is None:
-        raise AttributeError("Decoder has no dense_embedding; cannot adapt export input spatial size")
+def _resize_decoder_spatial_buffer(decoder: torch.nn.Module, buffer_name: str, image_h: int, image_w: int) -> None:
+    tensor = getattr(decoder, buffer_name, None)
+    if tensor is None:
+        raise AttributeError(f"Decoder has no {buffer_name}; cannot adapt export input spatial size")
 
-    current_h = int(dense_embedding.shape[2])
-    current_w = int(dense_embedding.shape[3])
+    current_h = int(tensor.shape[2])
+    current_w = int(tensor.shape[3])
     if current_h == image_h and current_w == image_w:
         return
 
     resized = torch.nn.functional.interpolate(
-        dense_embedding.detach(),
+        tensor.detach(),
         size=(image_h, image_w),
         mode="bilinear",
         align_corners=False,
     )
-    resized = resized.to(device=dense_embedding.device, dtype=dense_embedding.dtype).contiguous()
+    resized = resized.to(device=tensor.device, dtype=tensor.dtype).contiguous()
 
-    # Buffer shape changes from e.g. [1, C, 1, 1] to [1, C, H, W], so we must replace
-    # the buffer instead of using in-place copy_ (which requires identical shapes).
-    if isinstance(getattr(decoder, "_buffers", None), dict) and "dense_embedding" in decoder._buffers:
-        decoder._buffers["dense_embedding"] = resized
+    if isinstance(getattr(decoder, "_buffers", None), dict) and buffer_name in decoder._buffers:
+        decoder._buffers[buffer_name] = resized
     else:
-        setattr(decoder, "dense_embedding", resized)
+        setattr(decoder, buffer_name, resized)
 
+
+def adapt_decoder_dense_embedding_size(decoder: torch.nn.Module, image_h: int, image_w: int) -> None:
+    # Both buffers participate in src/key PE composition; they must stay spatially aligned.
+    _resize_decoder_spatial_buffer(decoder, "dense_embedding", image_h, image_w)
+    _resize_decoder_spatial_buffer(decoder, "image_pe", image_h, image_w)
     setattr(decoder, "embed_h", image_h)
     setattr(decoder, "embed_w", image_w)
 

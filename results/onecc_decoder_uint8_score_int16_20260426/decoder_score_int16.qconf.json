@@ -1,0 +1,23 @@
+{
+  "default_quantization_dtype": "uint8",
+  "default_granularity": "channel",
+  "layers": [
+    {
+      "names": [
+        "/Sub_11",
+        "/Mul_12",
+        "/Sigmoid",
+        "/ReduceSum",
+        "/ReduceSum_1",
+        "/Sub_12",
+        "/Mul_13",
+        "/Sigmoid_1",
+        "/ReduceSum_2",
+        "/ReduceSum_3",
+        "/Div"
+      ],
+      "dtype": "int16",
+      "granularity": "channel"
+    }
+  ]
+}
